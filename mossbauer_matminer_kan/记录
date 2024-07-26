@@ -1,0 +1,714 @@
+import argparse
+
+import numpy as np
+from ase.db import connect
+from matminer.featurizers.site import AverageBondAngle
+from pymatgen.analysis.local_env import VoronoiNN
+from matminer.featurizers.site.bonding import AverageBondLength
+from ase import Atoms
+from tqdm import tqdm
+from kan import *
+import sys
+from pymatgen.core import Structure
+from ase.build import bulk
+from ase import Atom, Atoms
+from dscribe.descriptors import SOAP
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import sympy as sp
+from pymatgen.io.ase import AseAtomsAdaptor
+
+# bash megnet_orig.sh
+parser = argparse.ArgumentParser(description='KAN for mossbauer')
+parser.add_argument('--predict_item', choices=['mm', 'efg', 'rto', 'eta', 'hff'], default='mm',
+                    help="可选预测值:'mm', 'efg', 'rto', 'eta', 'hff'")
+
+args = parser.parse_args()
+
+
+def extract_descriptor(rows):
+    featurizers_site, targets = [], []  # 存储 描述符 和 目标值
+    for row in tqdm(rows, desc="获取结构描述信息", leave=True):
+        atoms_Au_Fe = row.toatoms()  # 转为原子对象
+        atoms_all_Fe = Atoms()
+        atoms_all_Fe.set_cell(atoms_Au_Fe.get_cell())  # 设置晶胞参数
+        atoms_all_Fe.set_pbc(atoms_Au_Fe.get_pbc())  # 设置周期性边界条件
+        Au_idx_lst = []  # 存储转换前的Au的索引
+        # 将Au转化为Fe，并记录Au的位置
+        for idx, at in enumerate(atoms_Au_Fe):
+            if at.symbol == 'Fe':
+                atoms_all_Fe.append(Atom(at.symbol, at.position))
+            elif at.symbol == 'Au':
+                atoms_all_Fe.append(Atom('Fe', at.position))  # 将金原子替换为铁原子并添加到新的原子对象中
+                Au_idx_lst.append(idx)  # 记录金原子的索引
+            else:
+                atoms_all_Fe.append(Atom(at.symbol, at.position))
+
+        # 将 ASE 的 Atoms 对象转换为 Pymatgen 的 Structure 对象
+        structure = AseAtomsAdaptor.get_structure(atoms_all_Fe)
+
+        cutoff = 3
+        vnn = VoronoiNN(cutoff=cutoff)
+        all_descriptor = []
+        Fe_count = []  # Fe原子数量
+        S_count = []  # S原子数量
+        avg_BondAngle = []  # 平均键角
+        avg_BondLength = []  # 平均键长
+        # 键长 键角
+        BondAngle = AverageBondAngle(vnn)
+        BondLength = AverageBondLength(vnn)
+        try:
+            # 计算每个 Au 原子的描述符
+            for au_idx in Au_idx_lst:
+                # 统计 Fe 和 S 原子的数量
+                fe_count = 0
+                s_count = 0
+                neighbors = vnn.get_nn_info(structure, au_idx)
+                for neighbor in neighbors:
+                    element = neighbor['site'].species_string
+                    if element == "Fe":
+                        fe_count += 1
+                    elif element == "S":
+                        s_count += 1
+                Fe_count.append(fe_count)
+                S_count.append(s_count)
+                descriptor_angle = BondAngle.featurize(structure, au_idx)
+                descriptor_length = BondLength.featurize(structure, au_idx)
+                avg_BondAngle.append(descriptor_angle)
+                avg_BondLength.append(descriptor_length)
+
+            all_descriptor.extend([np.mean(Fe_count)])
+            all_descriptor.extend([np.mean(S_count)])
+            all_descriptor.extend(np.mean(avg_BondAngle, axis=0))
+            all_descriptor.extend(np.mean(avg_BondLength, axis=0))
+            featurizers_site.append(all_descriptor)
+
+            if args.predict_item == 'rto':
+                targets.append([row.data[predict_item] / 10000])
+            elif args.predict_item == 'hff':
+                targets.append([row.data[predict_item] / 10])
+            else:
+                targets.append([row.data[predict_item]])
+        except ValueError as e:
+            print(f"cutoff = {cutoff} 时，{atoms_Au_Fe}没有相邻元素")
+            continue
+    return featurizers_site, targets
+
+
+def formula_mae(formula_, X, y):
+    batch = X.shape[0]
+    total_error = 0
+    for i in range(batch):
+        # 将特征值代入公式，计算输出
+        prediction = np.array(
+            formula_.subs('x_1', X[i, 0])
+            .subs('x_2', X[i, 1])
+            .subs('x_3', X[i, 2])
+            .subs('x_4', X[i, 3])
+        ).astype(np.float64)
+        # 计算绝对误差
+        total_error += np.abs(prediction - y[i])
+    # 计算平均绝对误差
+    mean_absolute_error = total_error / batch
+    return mean_absolute_error
+
+
+if __name__ == '__main__':
+    # seed
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.set_default_dtype(torch.float64)
+
+    # 数据集设置
+    train_ratio = 0.8
+    test_ratio = 0.2
+    rcut = 6.0
+    nmax = 8
+    lmax = 6
+    predict_item = args.predict_item
+
+    db_name = 'mossbauer.db'
+    db = connect(db_name)
+    rows = list(db.select())
+    random.shuffle(rows)
+
+    # training dataset
+    train_lst, tgt_lst = extract_descriptor(rows[:int(train_ratio * len(rows))])
+    # test dataset
+    test_lst, test_tgt_lst = extract_descriptor(
+        rows[int(train_ratio * len(rows)):int((train_ratio + test_ratio) * len(rows))])
+    train_input = torch.from_numpy(np.array(train_lst)).to('cpu')
+    train_label = torch.from_numpy(np.array(tgt_lst)).to('cpu')
+    test_input = torch.from_numpy(np.array(test_lst)).to('cpu')
+    test_label = torch.from_numpy(np.array(test_tgt_lst)).to('cpu')
+
+    # Check for NaNs and infinities in the data
+    assert not torch.isnan(train_input).any(), "NaNs found in train_input"
+    assert not torch.isnan(train_label).any(), "NaNs found in train_label"
+    assert not torch.isnan(test_input).any(), "NaNs found in test_input"
+    assert not torch.isnan(test_label).any(), "NaNs found in test_label"
+    assert not torch.isinf(train_input).any(), "Infs found in train_input"
+    assert not torch.isinf(train_label).any(), "Infs found in train_label"
+    assert not torch.isinf(test_input).any(), "Infs found in test_input"
+    assert not torch.isinf(test_label).any(), "Infs found in test_label"
+
+    # 创建 dataset 字典
+    dataset = {}
+    dataset['train_input'] = train_input.double()
+    dataset['train_label'] = train_label.double()
+
+    dataset['test_input'] = test_input.double()
+    dataset['test_label'] = test_label.double()
+
+    # 输入、输出维度
+    input_dim = len(train_input[0])
+    output_dim = len(train_label[0])
+    # 迭代
+    grids = np.array([3, 10, 20, 50, 100])
+
+    train_losses = []
+    test_losses = []
+    steps = 100
+    k = 3
+
+    model = KAN(width=[input_dim, 4, 2, output_dim], grid=3, k=k, seed=seed, auto_save=True, base_fun='identity')
+    # Plot KAN at initialization
+    model(dataset['train_input'])
+    model.plot()
+    plt.savefig('初始模型plot.pdf')
+    plt.clf()
+
+    for i in range(grids.shape[0]):
+        if i == 0:
+            print("train with grid = ", grids[i])
+            model = KAN(width=[input_dim, 4, 2, output_dim], grid=grids[i], k=k, seed=seed, auto_save=True,
+                        base_fun='identity')
+        else:
+            print("change grid = ", grids[i])
+            model = model.refine(grids[i])
+
+        results = model.fit(dataset, opt="LBFGS", steps=steps, lamb=1e-3)
+        model.saveckpt(f'mossbauer_model/model_ckpt_grid={grids[i]}')
+        print(model.suggest_symbolic(0, 0, 0))
+        train_losses += results['train_loss']
+        test_losses += results['test_loss']
+
+    # Plot KAN after training
+    model = model.prune()
+    model(dataset['train_input'])
+    model.plot()
+    plt.savefig('剪枝plot.pdf')
+    plt.clf()
+
+    plt.plot(train_losses)
+    plt.plot(test_losses)
+    plt.legend(['train', 'test'])
+    plt.ylabel('RMSE')
+    plt.xlabel('step')
+    plt.yscale('log')
+    plt.savefig('训练过程.pdf')
+    plt.clf()
+
+
+    def train_mae():
+        predictions = model(dataset['train_input'])
+        labels = dataset['train_label']
+        mae = torch.mean(torch.abs(predictions - labels))
+        return mae
+
+
+    def test_mae():
+        predictions = model(dataset['test_input'])
+        labels = dataset['test_label']
+        mae = torch.mean(torch.abs(predictions - labels))
+        return mae
+
+
+    # # 公式
+    # lib = ['x', 'x^2', 'x^3', 'x^4', 'x^5', '1/x', '1/x^2', '1/x^3', '1/x^4', '1/x^5', 'sqrt', 'x^0.5', 'x^1.5','1/sqrt(x)','1/x^0.5', 'exp', 'log', 'abs', 'sin', 'cos', 'tan', 'tanh', 'sgn', 'arcsin', 'arccos', 'arctan', 'arctanh','0','gaussian']
+    lib = ['x', 'x^2', 'x^3', 'x^4', 'exp', 'log', 'tanh', 'sin', 'abs']
+
+    # lib = ['x', 'x^2', 'x^3', 'x^4', 'x^5', '1/x', '1/x^2', '1/x^3', '1/x^4', '1/x^5', 'sqrt', 'x^0.5', 'x^1.5', '1/sqrt(x)',
+    #      '1/x^0.5', 'exp', 'log', 'abs', 'sin', 'cos', 'tan', 'tanh', 'sgn', 'arcsin', 'arccos', 'arctan', 'arctanh', '0',
+    #      'gaussian']
+    model.auto_symbolic(lib=lib)
+
+    model.fit(dataset, opt="LBFGS", steps=100, lamb=1e-3, metrics=(train_mae, test_mae))  # 50
+    # Plot KAN at initialization
+    model(dataset['train_input'])
+    model.plot()
+    plt.savefig('formula_plot.pdf')
+    plt.clf()
+    model.saveckpt(f'mossbauer_model/model_ckpt_formula')
+    print(model.suggest_symbolic(0, 0, 0))
+    # 符号公式
+    formula = model.symbolic_formula()[0][0]
+    print(formula)
+
+    # Calculate mae on training and test sets
+    if args.predict_item == 'rto':
+        print('Train mae of the formula:',
+              formula_mae(formula, dataset['train_input'].numpy(), (dataset['train_label'] * 10000).numpy()))
+        print('Test mae of the formula:',
+              formula_mae(formula, dataset['test_input'].numpy(), (dataset['test_label'] * 10000).numpy()))
+    elif args.predict_item == 'hff':
+        print('Train mae of the formula:',
+              formula_mae(formula, dataset['train_input'].numpy(), (dataset['train_label'] * 10).numpy()))
+        print('Test mae of the formula:',
+              formula_mae(formula, dataset['test_input'].numpy(), (dataset['test_label'] * 10).numpy()))
+    else:
+        print('Train mae of the formula:',
+              formula_mae(formula, dataset['train_input'].numpy(), dataset['train_label'].numpy()))
+        print('Test mae of the formula:',
+              formula_mae(formula, dataset['test_input'].numpy(), dataset['test_label'].numpy()))
+
+
+
+C:\Anaconda3\envs\kan\python.exe D:\python_project\mossbauer_preprocess\mossbauer_matminer_kan\matminer_kan_mossbauer.py
+获取结构描述信息:   6%|▌         | 116/2054 [00:02<00:48, 39.85it/s]C:\Users\log3me\AppData\Roaming\Python\Python310\site-packages\matminer\featurizers\site\bonding.py:245: RuntimeWarning: invalid value encountered in arccos
+  if np.isnan(np.arccos(dot)):
+获取结构描述信息:  43%|████▎     | 881/2054 [00:21<00:26, 43.78it/s]cutoff = 3 时，Atoms(symbols='S16FeS3AuFe8', pbc=True, cell=[[-3.6721001022974766, 3.672100102297478, 10.242900140583826], [3.6721001022974775, -3.672100102297477, 10.242900140583826], [3.6721001022974775, 3.672100102297477, -10.242900140583826]])没有相邻元素
+获取结构描述信息: 100%|██████████| 2054/2054 [00:51<00:00, 40.10it/s]
+获取结构描述信息: 100%|██████████| 514/514 [00:13<00:00, 38.74it/s]
+Directory already exists: ./model
+train with grid =  3
+Directory already exists: ./model
+train loss: 9.53e-01 | test loss: 9.80e-01 | reg: 1.39e+01 : 100%|█| 100/100 [01:14<00:00,  1.34it/s
+    function  fitting r2   r2 loss  complexity  complexity loss  total loss
+0          0    0.000000  0.000014           0                0    0.000003
+1          x    0.842078 -2.662624           1                1    0.267475
+2  1/sqrt(x)    0.985035 -6.061304           2                2    0.387739
+3    1/x^0.5    0.985035 -6.061304           2                2    0.387739
+4        1/x    0.984760 -6.035003           2                2    0.392999
+('0', (<function <lambda> at 0x0000025CA0A875B0>, <function <lambda> at 0x0000025CA0A87640>, 0, <function <lambda> at 0x0000025CA0A876D0>), 0.0, 0)
+change grid =  10
+train loss: 1.19e+00 | test loss: 1.25e+00 | reg: 1.95e+02 : 100%|█| 100/100 [00:49<00:00,  2.01it/s
+    function  fitting r2   r2 loss  complexity  complexity loss  total loss
+0          x    0.997734 -8.779130           1                1   -0.955826
+1      x^0.5    0.999016 -9.974080           2                2   -0.394816
+2       sqrt    0.999016 -9.974080           2                2   -0.394816
+3        log    0.998968 -9.906921           2                2   -0.381384
+4  1/sqrt(x)    0.998943 -9.872038           2                2   -0.374408
+('x', (<function <lambda> at 0x0000025CA0A85120>, <function <lambda> at 0x0000025CA0A851B0>, 1, <function <lambda> at 0x0000025CA0A85240>), 0.9977337580814559, 1)
+change grid =  20
+train loss: 9.24e-01 | test loss: 1.01e+00 | reg: 7.77e+01 : 100%|█| 100/100 [01:23<00:00,  1.20it/s
+  function  fitting r2   r2 loss  complexity  complexity loss  total loss
+0        x    0.998289 -9.182122           1                1   -1.036424
+1    x^0.5    0.998715 -9.593361           2                2   -0.318672
+2     sqrt    0.998715 -9.593361           2                2   -0.318672
+3      exp    0.998701 -9.576863           2                2   -0.315373
+4      log    0.998680 -9.554232           2                2   -0.310846
+('x', (<function <lambda> at 0x0000025CA0A85120>, <function <lambda> at 0x0000025CA0A851B0>, 1, <function <lambda> at 0x0000025CA0A85240>), 0.9982885045922175, 1)
+change grid =  50
+train loss: 9.19e-01 | test loss: 2.02e+01 | reg: 6.65e+01 : 100%|█| 100/100 [01:29<00:00,  1.12it/s
+  function  fitting r2   r2 loss  complexity  complexity loss  total loss
+0        x    0.995878 -7.918902           1                1   -0.783780
+1      sin    0.996839 -8.300837           2                2   -0.060167
+2      cos    0.996839 -8.300837           2                2   -0.060167
+3      exp    0.996350 -8.094075           2                2   -0.018815
+4      x^2    0.996348 -8.093108           2                2   -0.018622
+('x', (<function <lambda> at 0x0000025CA0A85120>, <function <lambda> at 0x0000025CA0A851B0>, 1, <function <lambda> at 0x0000025CA0A85240>), 0.9958778789799473, 1)
+change grid =  100
+train loss: 7.71e-01 | test loss: 1.20e+00 | reg: 7.04e+01 : 100%|█| 100/100 [01:50<00:00,  1.10s/it
+  function  fitting r2   r2 loss  complexity  complexity loss  total loss
+0        0    0.000000  0.000014           0                0    0.000003
+1        x    0.676661 -1.628837           1                1    0.474233
+2      cos    0.933318 -3.906340           2                2    0.818732
+3      sin    0.933318 -3.906340           2                2    0.818732
+4      x^2    0.930639 -3.849521           2                2    0.830096
+('0', (<function <lambda> at 0x0000025CA0A875B0>, <function <lambda> at 0x0000025CA0A87640>, 0, <function <lambda> at 0x0000025CA0A876D0>), 0.0, 0)
+fixing (0,0,0) with x, r2=0.6989561661216492, c=1
+fixing (0,0,1) with x, r2=0.9999990260040073, c=1
+fixing (0,0,2) with x, r2=0.9999931128986244, c=1
+fixing (0,0,3) with x, r2=0.02271889718906817, c=1
+fixing (0,1,0) with x, r2=0.9999259120300944, c=1
+fixing (0,1,1) with x, r2=0.9999973341736184, c=1
+fixing (0,1,2) with x, r2=0.9993613125733752, c=1
+fixing (0,1,3) with x, r2=0.9996748118551633, c=1
+fixing (0,2,0) with x, r2=0.35197639509997675, c=1
+fixing (0,2,1) with x, r2=0.8692922211360065, c=1
+fixing (0,2,2) with 0
+fixing (0,2,3) with x, r2=0.8920566622466919, c=1
+fixing (0,3,0) with x, r2=0.749660062651559, c=1
+fixing (0,3,1) with x, r2=0.9868133312395668, c=1
+fixing (0,3,2) with 0
+fixing (0,3,3) with x, r2=0.9391980293985966, c=1
+fixing (1,0,0) with x, r2=0.9802968564668607, c=1
+fixing (1,0,1) with x, r2=0.9998839115612911, c=1
+fixing (1,1,0) with x, r2=0.97105569277359, c=1
+fixing (1,1,1) with x, r2=0.9939221408570112, c=1
+fixing (1,2,0) with x, r2=0.9877723211407171, c=1
+fixing (1,2,1) with x, r2=0.9990784308938573, c=1
+fixing (1,3,0) with x, r2=0.9999999999997776, c=1
+fixing (1,3,1) with 0
+fixing (2,0,0) with x, r2=0.9435746269249641, c=1
+fixing (2,1,0) with x, r2=0.9999986511530178, c=1
+train loss: 1.03e+00 | test loss: 1.08e+00 | reg: 6.64e+01 : 100%|█| 100/100 [01:00<00:00,  1.65it/s
+  function   fitting r2    r2 loss  complexity  complexity loss  total loss
+0        0 -100000000.0  26.575425           0                0    5.315085
+1        x -100000000.0  26.575425           1                1    6.115085
+2      cos -100000000.0  26.575425           2                2    6.915085
+3      sin -100000000.0  26.575425           2                2    6.915085
+4      log -100000000.0  26.575425           2                2    6.915085
+('0', (<function <lambda> at 0x0000025CA0A875B0>, <function <lambda> at 0x0000025CA0A87640>, 0, <function <lambda> at 0x0000025CA0A876D0>), -100000000.0, 0)
+-0.603455863006729*x_1 - 0.705249726194445*x_2 - 0.878242588266417*x_3 + 12.3050080317852*x_4 + 54.4281072987743 - 78.9396969923735*exp(-0.0399999999999997*(-0.02*x_1 - 1)**2)
+Train mae of the formula: [0.73485257]
+Test mae of the formula: [0.76614153]
+
+Process finished with exit code 0
+
+
+import argparse
+
+import numpy as np
+from ase.db import connect
+from matminer.featurizers.site import AverageBondAngle
+from pymatgen.analysis.local_env import VoronoiNN
+from matminer.featurizers.site.bonding import AverageBondLength
+from ase import Atoms
+from tqdm import tqdm
+from kan import *
+import sys
+from pymatgen.core import Structure
+from ase.build import bulk
+from ase import Atom, Atoms
+from dscribe.descriptors import SOAP
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import sympy as sp
+from pymatgen.io.ase import AseAtomsAdaptor
+
+parser = argparse.ArgumentParser(description='KAN for mossbauer')
+parser.add_argument('--predict_item', choices=['mm', 'efg', 'rto', 'eta', 'hff'], default='eta',
+                    help="可选预测值:'mm', 'efg', 'rto', 'eta', 'hff'")
+parser.add_argument('--steps', default=100, type=int, help='number of steps in KAN model fit') # 100
+parser.add_argument('--k', default=3, type=int, help='number of k in KAN model init')
+parser.add_argument('--grids', type=str, default='3,10,20', help='list of integers')# '3,10,20,50,100'
+parser.add_argument('--model_width', type=str, default='4,4,2,1',
+                    help='Comma-separated list of model widths')
+args = parser.parse_args()
+
+
+def extract_descriptor(rows):
+    featurizers_site, targets = [], []  # 存储 描述符 和 目标值
+    for row in tqdm(rows, desc="获取结构描述信息", leave=True):
+        atoms_Au_Fe = row.toatoms()  # 转为原子对象
+        atoms_all_Fe = Atoms()
+        atoms_all_Fe.set_cell(atoms_Au_Fe.get_cell())  # 设置晶胞参数
+        atoms_all_Fe.set_pbc(atoms_Au_Fe.get_pbc())  # 设置周期性边界条件
+        Au_idx_lst = []  # 存储转换前的Au的索引
+        # 将Au转化为Fe，并记录Au的位置
+        for idx, at in enumerate(atoms_Au_Fe):
+            if at.symbol == 'Fe':
+                atoms_all_Fe.append(Atom(at.symbol, at.position))
+            elif at.symbol == 'Au':
+                atoms_all_Fe.append(Atom('Fe', at.position))  # 将金原子替换为铁原子并添加到新的原子对象中
+                Au_idx_lst.append(idx)  # 记录金原子的索引
+            else:
+                atoms_all_Fe.append(Atom(at.symbol, at.position))
+
+        # 将 ASE 的 Atoms 对象转换为 Pymatgen 的 Structure 对象
+        structure = AseAtomsAdaptor.get_structure(atoms_all_Fe)
+
+        cutoff = 3
+        vnn = VoronoiNN(cutoff=cutoff)
+        all_descriptor = []
+        Fe_count = []  # Fe原子数量
+        S_count = []  # S原子数量
+        avg_BondAngle = []  # 平均键角
+        avg_BondLength = []  # 平均键长
+        # 键长 键角
+        BondAngle = AverageBondAngle(vnn)
+        BondLength = AverageBondLength(vnn)
+        try:
+            # 计算每个 Au 原子的描述符
+            for au_idx in Au_idx_lst:
+                # 统计 Fe 和 S 原子的数量
+                fe_count = 0
+                s_count = 0
+                neighbors = vnn.get_nn_info(structure, au_idx)
+                for neighbor in neighbors:
+                    element = neighbor['site'].species_string
+                    if element == "Fe":
+                        fe_count += 1
+                    elif element == "S":
+                        s_count += 1
+                Fe_count.append(fe_count)
+                S_count.append(s_count)
+                descriptor_angle = BondAngle.featurize(structure, au_idx)
+                descriptor_length = BondLength.featurize(structure, au_idx)
+                avg_BondAngle.append(descriptor_angle)
+                avg_BondLength.append(descriptor_length)
+
+            all_descriptor.extend([np.mean(Fe_count)])
+            all_descriptor.extend([np.mean(S_count)])
+            all_descriptor.extend(np.mean(avg_BondAngle, axis=0))
+            all_descriptor.extend(np.mean(avg_BondLength, axis=0))
+            featurizers_site.append(all_descriptor)
+
+            if args.predict_item == 'rto':
+                targets.append([row.data[predict_item] / 10000])
+            elif args.predict_item == 'hff':
+                targets.append([row.data[predict_item] / 10])
+            else:
+                targets.append([row.data[predict_item]])
+        except ValueError as e:
+            print(f"cutoff = {cutoff} 时，{atoms_Au_Fe}没有相邻元素")
+            continue
+    return featurizers_site, targets
+
+
+def formula_mae(formula_, X, y):
+    batch = X.shape[0]
+    total_error = 0
+    for i in range(batch):
+        # 将特征值代入公式，计算输出
+        prediction = np.array(
+            formula_.subs('x_1', X[i, 0])
+            .subs('x_2', X[i, 1])
+            .subs('x_3', X[i, 2])
+            .subs('x_4', X[i, 3])
+        ).astype(np.float64)
+        if args.predict_item == 'rto':
+            pre = prediction*10000
+            la = y[i]*10000
+        elif args.predict_item == 'hff':
+            pre = prediction * 10
+            la = y[i] * 10
+        else:
+            pre = prediction
+            la = y[i]
+        total_error += np.abs(pre - la)
+    # 计算平均绝对误差
+    mean_absolute_error = total_error / batch
+    return mean_absolute_error
+
+
+if __name__ == '__main__':
+
+    # model_dir = os.path.dirname('./mossbauer_model/')
+    # os.makedirs(model_dir, exist_ok=True)
+    print(args)
+    # seed
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.set_default_dtype(torch.float64)
+
+    # 数据集设置
+    train_ratio = 0.8
+    test_ratio = 0.2
+    rcut = 6.0
+    nmax = 8
+    lmax = 6
+    predict_item = args.predict_item
+
+    db_name = 'mossbauer.db'
+    db = connect(db_name)
+    rows = list(db.select())
+    random.shuffle(rows)
+
+    # training dataset
+    train_lst, tgt_lst = extract_descriptor(rows[:int(train_ratio * len(rows))])
+    # test dataset
+    test_lst, test_tgt_lst = extract_descriptor(
+        rows[int(train_ratio * len(rows)):int((train_ratio + test_ratio) * len(rows))])
+    train_input = torch.from_numpy(np.array(train_lst)).to('cpu')
+    train_label = torch.from_numpy(np.array(tgt_lst)).to('cpu')
+    test_input = torch.from_numpy(np.array(test_lst)).to('cpu')
+    test_label = torch.from_numpy(np.array(test_tgt_lst)).to('cpu')
+
+    # Check for NaNs and infinities in the data
+    assert not torch.isnan(train_input).any(), "NaNs found in train_input"
+    assert not torch.isnan(train_label).any(), "NaNs found in train_label"
+    assert not torch.isnan(test_input).any(), "NaNs found in test_input"
+    assert not torch.isnan(test_label).any(), "NaNs found in test_label"
+    assert not torch.isinf(train_input).any(), "Infs found in train_input"
+    assert not torch.isinf(train_label).any(), "Infs found in train_label"
+    assert not torch.isinf(test_input).any(), "Infs found in test_input"
+    assert not torch.isinf(test_label).any(), "Infs found in test_label"
+
+    # 创建 dataset 字典
+    dataset = {}
+    dataset['train_input'] = train_input.double()
+    dataset['train_label'] = train_label.double()
+
+    dataset['test_input'] = test_input.double()
+    dataset['test_label'] = test_label.double()
+
+    # 输入、输出维度
+    input_dim = len(train_input[0])
+    output_dim = len(train_label[0])
+    # 迭代
+    grids = np.fromstring(args.grids, dtype=int, sep=',')
+    # grids = np.array([3, 10, 20, 50, 100])
+
+    train_losses = []
+    test_losses = []
+    steps = args.steps
+    k = args.k
+
+    # model_width = [input_dim, 4, 2, output_dim]
+    model_width = list(map(int, args.model_width.split(',')))
+    model = KAN(width=model_width, grid=3, k=k, seed=seed, auto_save=True, base_fun='identity')  # 'identity' 'silu' affine_trainable=True
+    # Plot KAN at initialization
+    model(dataset['train_input'])
+    model.plot()
+    plt.savefig('初始模型plot.pdf')
+    plt.clf()
+
+    for i in range(grids.shape[0]):
+        if i == 0:
+            print("train with grid = ", grids[i])
+            model = KAN(width=model_width, grid=grids[i], k=k, seed=seed, auto_save=True, base_fun='identity')
+        else:
+            print("change grid = ", grids[i])
+            model = model.refine(grids[i])
+
+        results = model.fit(dataset, opt="LBFGS", steps=steps, lamb=1e-3)
+        print(model.suggest_symbolic(0, 0, 0))
+        train_losses += results['train_loss']
+        test_losses += results['test_loss']
+
+    # Plot KAN after training
+    model = model.prune()
+    model(dataset['train_input'])
+    model.plot()
+    plt.savefig('剪枝plot.pdf')
+    plt.clf()
+
+    plt.plot(train_losses)
+    plt.plot(test_losses)
+    plt.legend(['train', 'test'])
+    plt.ylabel('RMSE')
+    plt.xlabel('step')
+    plt.yscale('log')
+    plt.savefig('训练过程.pdf')
+    plt.clf()
+
+
+    def train_mae():
+        predictions = model(dataset['train_input'])
+        labels = dataset['train_label']
+        mae = torch.mean(torch.abs(predictions - labels))
+        return mae
+
+
+    def test_mae():
+        predictions = model(dataset['test_input'])
+        labels = dataset['test_label']
+        mae = torch.mean(torch.abs(predictions - labels))
+        return mae
+
+    model(dataset['train_input'])
+    model.plot()
+    plt.savefig('before_formula_plot.pdf')
+    plt.clf()
+
+    # # 公式
+    # lib = ['x', 'x^2', 'x^3', 'x^4', 'x^5', '1/x', '1/x^2', '1/x^3', '1/x^4', '1/x^5', 'sqrt', 'x^0.5', 'x^1.5','1/sqrt(x)','1/x^0.5', 'exp', 'log', 'abs', 'sin', 'cos', 'tan', 'tanh', 'sgn', 'arcsin', 'arccos', 'arctan', 'arctanh','0','gaussian']
+    lib = ['x', 'x^2', 'x^3', 'exp', 'log', 'tanh', 'sin', 'abs', 'x^0.5', 'x^1.5']
+    model.auto_symbolic(lib=lib)
+
+    model.fit(dataset, opt="LBFGS", steps=steps, lamb=1e-3, metrics=(train_mae, test_mae))  # 50
+    # Plot KAN at initialization
+    # model(dataset['train_input'])
+    # model.plot()
+    # plt.savefig('formula_plot.pdf')
+    # plt.clf()
+    print(model.suggest_symbolic(0, 0, 0))
+    # 符号公式
+    formula = model.symbolic_formula()[0][0]
+    print(formula)
+
+    # Calculate mae on training and test sets
+    print('Train mae of the formula:',
+          formula_mae(formula, dataset['train_input'].numpy(), dataset['train_label'].numpy()))
+    print('Test mae of the formula:',
+          formula_mae(formula, dataset['test_input'].numpy(), dataset['test_label'].numpy()))
+
+
+C:\Anaconda3\envs\kan\python.exe D:\python_project\mossbauer_preprocess\mossbauer_matminer_kan\main.py
+Namespace(predict_item='eta', steps=100, k=3, grids='3,10,20', model_width='4,4,2,1')
+获取结构描述信息:   6%|▌         | 117/2054 [00:02<00:48, 39.91it/s]C:\Users\log3me\AppData\Roaming\Python\Python310\site-packages\matminer\featurizers\site\bonding.py:245: RuntimeWarning: invalid value encountered in arccos
+  if np.isnan(np.arccos(dot)):
+获取结构描述信息:  43%|████▎     | 884/2054 [00:21<00:27, 42.25it/s]cutoff = 3 时，Atoms(symbols='S16FeS3AuFe8', pbc=True, cell=[[-3.6721001022974766, 3.672100102297478, 10.242900140583826], [3.6721001022974775, -3.672100102297477, 10.242900140583826], [3.6721001022974775, 3.672100102297477, -10.242900140583826]])没有相邻元素
+获取结构描述信息: 100%|██████████| 2054/2054 [00:48<00:00, 42.61it/s]
+获取结构描述信息: 100%|██████████| 514/514 [00:12<00:00, 40.17it/s]
+Directory already exists: ./model
+train with grid =  3
+Directory already exists: ./model
+train loss: 2.87e-01 | test loss: 2.88e-01 | reg: 2.49e+00 : 100%|█| 100/100 [01:07<00:00,  1.48it/s
+  function  fitting r2   r2 loss  complexity  complexity loss  total loss
+0        0    0.000000  0.000014           0                0    0.000003
+1      x^2    0.956296 -4.515757           2                2    0.696849
+2      sin    0.947517 -4.251723           2                2    0.749655
+3      cos    0.946950 -4.236230           2                2    0.752754
+4        x    0.024040 -0.035092           1                1    0.792982
+('0', (<function <lambda> at 0x0000015C8FDFB520>, <function <lambda> at 0x0000015C8FDFB5B0>, 0, <function <lambda> at 0x0000015C8FDFB640>), 0.0, 0)
+change grid =  10
+train loss: 2.78e-01 | test loss: 2.90e-01 | reg: 3.88e+00 : 100%|█| 100/100 [01:13<00:00,  1.37it/s
+  function  fitting r2   r2 loss  complexity  complexity loss  total loss
+0        0    0.000000  0.000014           0                0    0.000003
+1        x    0.043772 -0.064559           1                1    0.787088
+2      sin    0.628887 -1.430032           2                2    1.313994
+3      cos    0.628887 -1.430030           2                2    1.313994
+4      1/x    0.398529 -0.733409           2                2    1.453318
+('0', (<function <lambda> at 0x0000015C8FDFB520>, <function <lambda> at 0x0000015C8FDFB5B0>, 0, <function <lambda> at 0x0000015C8FDFB640>), 0.0, 0)
+change grid =  20
+train loss: 2.54e-01 | test loss: 3.27e-01 | reg: 9.17e+00 : 100%|█| 100/100 [01:14<00:00,  1.34it/s
+  function  fitting r2   r2 loss  complexity  complexity loss  total loss
+0        0    0.000000  0.000014           0                0    0.000003
+1        x    0.190468 -0.304821           1                1    0.739036
+2    1/x^2    0.758362 -2.049019           2                2    1.190196
+3      sin    0.575205 -1.235128           2                2    1.352974
+4      cos    0.575205 -1.235128           2                2    1.352974
+('0', (<function <lambda> at 0x0000015C8FDFB520>, <function <lambda> at 0x0000015C8FDFB5B0>, 0, <function <lambda> at 0x0000015C8FDFB640>), 0.0, 0)
+fixing (0,0,0) with x, r2=0.22345874769028773, c=1
+fixing (0,0,1) with x, r2=0.13801462744913232, c=1
+fixing (0,0,2) with x, r2=0.7847576272994863, c=1
+fixing (0,0,3) with x, r2=0.13691930247713385, c=1
+fixing (0,1,0) with x, r2=0.9294260218439642, c=1
+fixing (0,1,1) with x, r2=0.07963214196599319, c=1
+fixing (0,1,2) with x, r2=0.7838094596758695, c=1
+fixing (0,1,3) with x, r2=0.8061330144837906, c=1
+fixing (0,2,0) with x, r2=0.4385755754016785, c=1
+fixing (0,2,1) with x, r2=0.04199455565257255, c=1
+fixing (0,2,2) with x, r2=0.4818279930432072, c=1
+fixing (0,2,3) with x, r2=6.223046245968671e-05, c=1
+fixing (0,3,0) with x, r2=0.226180012670585, c=1
+fixing (0,3,1) with x, r2=0.35038503817882727, c=1
+fixing (0,3,2) with x, r2=0.2802502880930795, c=1
+fixing (0,3,3) with x, r2=0.30068010253562316, c=1
+fixing (1,0,0) with x, r2=0.190524081817962, c=1
+fixing (1,0,1) with x, r2=0.20065971110261127, c=1
+fixing (1,1,0) with x, r2=0.0844929533852497, c=1
+fixing (1,1,1) with x, r2=0.05739549653320608, c=1
+fixing (1,2,0) with x, r2=0.5748247421717643, c=1
+fixing (1,2,1) with x, r2=0.8552561846368102, c=1
+fixing (1,3,0) with x, r2=0.2108204024500622, c=1
+fixing (1,3,1) with x, r2=0.28697729442057407, c=1
+fixing (2,0,0) with x, r2=0.11531588906143792, c=1
+fixing (2,1,0) with x, r2=0.5518033561235659, c=1
+train loss: 3.00e-01 | test loss: 2.94e-01 | reg: 3.40e+00 : 100%|█| 100/100 [00:31<00:00,  3.13it/s
+  function   fitting r2    r2 loss  complexity  complexity loss  total loss
+0        0 -100000000.0  26.575425           0                0    5.315085
+1        x -100000000.0  26.575425           1                1    6.115085
+2      cos -100000000.0  26.575425           2                2    6.915085
+3      sin -100000000.0  26.575425           2                2    6.915085
+4      log -100000000.0  26.575425           2                2    6.915085
+('0', (<function <lambda> at 0x0000015C8FDFB520>, <function <lambda> at 0x0000015C8FDFB5B0>, 0, <function <lambda> at 0x0000015C8FDFB640>), -100000000.0, 0)
+-0.0108562931962394*x_1 - 0.0082540020391761*x_2 - 0.124461557486541*x_3 + 0.108407746688428*x_4 + 0.475258001320521 - 7.88031232863775e-5*exp(-0.0399999999999997*(-0.6*x_1 - 1)**2)
+Train mae of the formula: [0.25523059]
+Test mae of the formula: [0.24895213]
+
+Process finished with exit code 0

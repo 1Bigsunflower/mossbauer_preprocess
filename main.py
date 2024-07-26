@@ -1,11 +1,13 @@
 import os
+import sys
+
 import ase
 from ase.db import connect
 # TODO: use re to replace scf parser
 import extracted_data as extct_mh
 
-root_folder = './example'
-# root_folder = '../'
+root_folder = './dataset/MES_data'
+# root_folder = './example2'
 max_iron_cnt = 10000
 
 db_name = 'mossbauer.db'
@@ -55,13 +57,19 @@ def main():
     print('parse start: ')
     for root, dirs, files in os.walk(root_folder):
         print('Folder: ', root)
+        print(dirs)
+        print(files)
+
         if len(files) != 2:
             print('file count != 2, pass')
             print('-' * 100)
             continue
+
         struct_name, scf_name = '', ''
         for f in files:
             file_name = os.path.join(root, f)
+            print(file_name)
+            sys.exit()
             if f.endswith('.struct') and struct_name == '':
                 struct_name = file_name
             elif f.endswith('.scf') and scf_name == '':

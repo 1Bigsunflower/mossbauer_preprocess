@@ -20,10 +20,10 @@ import subprocess
 
 ############# as a parser lib, no need to import these libs. 2020.5.9 liuxiaotong
 
-# import xlrd,xlwt,xlutils
-# from xlutils.copy import copy
-# from pymatgen.core.structure import Structure
-# from pymatgen.core.periodic_table import Element, Specie
+import xlrd,xlwt,xlutils
+from xlutils.copy import copy
+from pymatgen.core.structure import Structure
+from pymatgen.core.periodic_table import Element, Specie
 
 def load_structure(struct_filename):
     """
